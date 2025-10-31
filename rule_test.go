@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
 
@@ -694,4 +695,218 @@ func ruleEquals(a, b Rule) bool {
 		a.Mark == b.Mark &&
 		(ptrEqual(a.Mask, b.Mask) || (a.Mark != 0 &&
 			(a.Mask == nil && *b.Mask == 0xFFFFFFFF || b.Mask == nil && *a.Mask == 0xFFFFFFFF)))
+}
+
+func expectRuleUpdate(ch <-chan RuleUpdate, msgType uint16, priority int) bool {
+	for {
+		timeout := time.After(time.Minute)
+		select {
+		case update := <-ch:
+			if update.Type == msgType && update.Rule.Priority == priority {
+				return true
+			}
+		case <-timeout:
+			return false
+		}
+	}
+}
+
+func TestRuleSubscribe(t *testing.T) {
+	t.Cleanup(setUpNetlinkTest(t))
+
+	ch := make(chan RuleUpdate)
+	done := make(chan struct{})
+	defer close(done)
+	if err := RuleSubscribe(ch, done); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a rule
+	srcNet := &net.IPNet{IP: net.IPv4(10, 0, 0, 0), Mask: net.CIDRMask(8, 32)}
+	rule := NewRule()
+	rule.Src = srcNet
+	rule.Priority = 5
+	rule.Family = FAMILY_V4
+	rule.Table = 100
+
+	if err := RuleAdd(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_NEWRULE, 5) {
+		t.Fatal("Add update not received as expected")
+	}
+
+	if err := RuleDel(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_DELRULE, 5) {
+		t.Fatal("Del update not received as expected")
+	}
+}
+
+func TestRuleSubscribeAt(t *testing.T) {
+	skipUnlessRoot(t)
+
+	// Create a handle on a custom netns
+	newNs, err := netns.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newNs.Close()
+
+	nh, err := NewHandleAt(newNs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nh.Close()
+
+	// Subscribe for Rule events on the custom netns
+	ch := make(chan RuleUpdate)
+	done := make(chan struct{})
+	defer close(done)
+	if err := RuleSubscribeAt(newNs, ch, done); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a rule in the custom netns
+	srcNet := &net.IPNet{IP: net.IPv4(10, 0, 0, 0), Mask: net.CIDRMask(8, 32)}
+	rule := NewRule()
+	rule.Src = srcNet
+	rule.Priority = 10
+	rule.Family = FAMILY_V4
+	rule.Table = 200
+
+	if err := nh.RuleAdd(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_NEWRULE, 10) {
+		t.Fatal("Add update not received as expected")
+	}
+
+	if err := nh.RuleDel(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_DELRULE, 10) {
+		t.Fatal("Del update not received as expected")
+	}
+}
+
+func TestRuleSubscribeWithOptions(t *testing.T) {
+	t.Cleanup(setUpNetlinkTest(t))
+
+	ch := make(chan RuleUpdate)
+	done := make(chan struct{})
+	defer close(done)
+	var lastError error
+	defer func() {
+		if lastError != nil {
+			t.Fatalf("Fatal error received during subscription: %v", lastError)
+		}
+	}()
+
+	if err := RuleSubscribeWithOptions(ch, done, RuleSubscribeOptions{
+		ErrorCallback: func(err error) {
+			lastError = err
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a rule
+	srcNet := &net.IPNet{IP: net.IPv4(10, 0, 0, 0), Mask: net.CIDRMask(8, 32)}
+	rule := NewRule()
+	rule.Src = srcNet
+	rule.Priority = 15
+	rule.Family = FAMILY_V4
+	rule.Table = 100
+
+	if err := RuleAdd(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_NEWRULE, 15) {
+		t.Fatal("Add update not received as expected")
+	}
+
+	if err := RuleDel(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_DELRULE, 15) {
+		t.Fatal("Del update not received as expected")
+	}
+}
+
+func TestRuleSubscribeListExisting(t *testing.T) {
+	skipUnlessRoot(t)
+
+	// Create a handle on a custom netns
+	newNs, err := netns.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newNs.Close()
+
+	nh, err := NewHandleAt(newNs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nh.Close()
+
+	// Add a rule before subscribing
+	srcNet := &net.IPNet{IP: net.IPv4(10, 0, 0, 0), Mask: net.CIDRMask(8, 32)}
+	rule := NewRule()
+	rule.Src = srcNet
+	rule.Priority = 20
+	rule.Family = FAMILY_V4
+	rule.Table = 100
+
+	if err := nh.RuleAdd(rule); err != nil {
+		t.Fatal(err)
+	}
+	defer nh.RuleDel(rule)
+
+	// Subscribe for Rule events including existing rules
+	ch := make(chan RuleUpdate)
+	done := make(chan struct{})
+	defer close(done)
+	if err := RuleSubscribeWithOptions(ch, done, RuleSubscribeOptions{
+		Namespace:    &newNs,
+		ListExisting: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should receive the existing rule
+	if !expectRuleUpdate(ch, unix.RTM_NEWRULE, 20) {
+		t.Fatal("Existing rule not received as expected")
+	}
+
+	// Add another rule after subscribing
+	srcNet2 := &net.IPNet{IP: net.IPv4(20, 0, 0, 0), Mask: net.CIDRMask(8, 32)}
+	rule2 := NewRule()
+	rule2.Src = srcNet2
+	rule2.Priority = 25
+	rule2.Family = FAMILY_V4
+	rule2.Table = 101
+
+	if err := nh.RuleAdd(rule2); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_NEWRULE, 25) {
+		t.Fatal("New rule update not received as expected")
+	}
+
+	if err := nh.RuleDel(rule2); err != nil {
+		t.Fatal(err)
+	}
+
+	if !expectRuleUpdate(ch, unix.RTM_DELRULE, 25) {
+		t.Fatal("Del update not received as expected")
+	}
 }

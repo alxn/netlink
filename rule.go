@@ -31,6 +31,13 @@ type Rule struct {
 	Type              uint8
 }
 
+// RuleUpdate is sent when a rule changes.
+type RuleUpdate struct {
+	Type    uint16
+	NlFlags uint16
+	Rule
+}
+
 func (r Rule) String() string {
 	from := "all"
 	if r.Src != nil && r.Src.String() != "<nil>" {
